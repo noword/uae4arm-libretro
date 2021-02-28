@@ -1,6 +1,11 @@
 #include "libretro.h"
 
+#ifdef VITA
+#define __GNU_VISIBLE 1
+#endif
 #include "libretro-core.h"
+
+#include "libretro/retrodep/WHDLoad_hdf.gz.c"
 
 #include "sysconfig.h"
 #include "sysdeps.h"
@@ -9,14 +14,19 @@
 
 #include "uae.h"
 
+#include "zlib.h"
+#include "fsdb.h"
+#include "filesys.h"
+#include "autoconf.h"
+
 cothread_t mainThread;
 cothread_t emuThread;
 
 int CROP_WIDTH;
 int CROP_HEIGHT;
 int VIRTUAL_WIDTH ;
-int retrow=1024; 
-int retroh=1024;
+int retrow=320; 
+int retroh=240;
 static unsigned msg_interface_version = 0;
 
 #define RETRO_DEVICE_AMIGA_KEYBOARD RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_KEYBOARD, 0)
@@ -97,11 +107,7 @@ void retro_set_environment(retro_environment_t cb)
    cb( RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports );
 
    struct retro_variable variables[] = {
-#ifdef VITA
-      { "uae4arm_model",          "Model; A500|A600|A1200", },
-#else
       { "uae4arm_model",          "Model; Auto|A500|A600|A1200", },
-#endif
       { "uae4arm_fastmem",        "Fast Mem; None|1 MB|2 MB|4 MB|8 MB", },
       { "uae4arm_resolution",     "Internal resolution; 640x270|320x240|320x256|320x262|640x240|640x256|640x262|640x270|768x270", },
       { "uae4arm_leds_on_screen", "Leds on screen; on|off", },
@@ -148,8 +154,25 @@ void Retro_Kickstart_Replacement_Msg(void)
 
 }
 
+void gz_uncompress(gzFile in, FILE *out)
+{
+   char gzbuf[16384];
+   int len;
+   int err;
 
-static void update_variables(void)
+   for (;;)
+   {
+      len = gzread(in, gzbuf, sizeof(gzbuf));
+      if (len < 0)
+         fprintf(stdout, "%s", gzerror(in, &err));
+      if (len == 0)
+         break;
+      if ((int)fwrite(gzbuf, 1, (unsigned)len, out) != len)
+         fprintf(stdout, "Write error!\n");
+   }
+}
+
+void update_prefs_retrocfg(struct uae_prefs * prefs)
 {
    uae_machine[0] = '\0';
    uae_config[0]  = '\0';
@@ -172,9 +195,9 @@ static void update_variables(void)
       if (pch)
          retroh = strtoul(pch, NULL, 0);
 
-      changed_prefs.gfx_size.width  = retrow;
-      changed_prefs.gfx_size.height = retroh;
-      changed_prefs.gfx_resolution  = changed_prefs.gfx_size.width > 600 ? 1 : 0;
+      prefs->gfx_size.width  = retrow;
+      prefs->gfx_size.height = retroh;
+      prefs->gfx_resolution  = prefs->gfx_size.width > 600 ? 1 : 0;
 
       LOGI("[libretro-uae4arm]: Got size: %u x %u.\n", retrow, retroh);
 
@@ -190,8 +213,8 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      if (strcmp(var.value, "on") == 0)  changed_prefs.leds_on_screen = 1;
-      if (strcmp(var.value, "off") == 0) changed_prefs.leds_on_screen = 0;
+      if (strcmp(var.value, "on") == 0)  prefs->leds_on_screen = 1;
+      if (strcmp(var.value, "off") == 0) prefs->leds_on_screen = 0;
    }
 
    var.key = "uae4arm_model";
@@ -199,7 +222,6 @@ static void update_variables(void)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       LOGI("[libretro-uae4arm]: Got model: %s.\n", var.value);
-#ifndef VITA
       if (strcmp(var.value, "Auto") == 0)
       {
          if (strcasestr(RPATH,"aga") != NULL)
@@ -209,52 +231,134 @@ static void update_variables(void)
          }
          else
          {
-            LOGI("[libretro-uae4arm]: Auto-model -> A500 selected\n");
-            var.value = "A500";
+            if ((strcasestr(RPATH,".hdf") != NULL) || (strcasestr(RPATH,".lha") != NULL))
+            {
+               if (strcasestr(RPATH,"cd32") != NULL)
+               {
+                  // Some whdload have cd32 in their name...
+                  LOGI("[libretro-uae4arm]: Auto-model -> A1200 selected\n");
+                  var.value = "A1200";
+               }
+               else
+               {
+                  LOGI("[libretro-uae4arm]: Auto-model -> A600 selected\n");
+                  var.value = "A600";
+               }
+            }
+            else
+            {
+               LOGI("[libretro-uae4arm]: Auto-model -> A500 selected\n");
+               var.value = "A500";
+            }
          }
       }
-#endif
+
+      // Treat .lha files as whdload slave. A better implementation would use zfile_isdiskimage...
+      if (strcasestr(RPATH,".lha") != NULL)
+      {
+
+          char whdload_hdf[512] = {0};
+          path_join((char*)&whdload_hdf, retro_save_directory, "WHDLoad.hdf");
+
+          /* Verify WHDLoad.hdf */
+          if (!my_existsfile(whdload_hdf))
+          {
+             LOGI("[libretro-uae4arm]: WHDLoad image file '%s' not found, attempting to create one\n", (const char*)&whdload_hdf);
+
+             char whdload_hdf_gz[512];
+             path_join((char*)&whdload_hdf_gz, retro_save_directory, "WHDLoad.hdf.gz");
+
+             FILE *whdload_hdf_gz_fp;
+             if ((whdload_hdf_gz_fp = fopen(whdload_hdf_gz, "wb")))
+             {
+                /* Write GZ */
+                fwrite(___whdload_WHDLoad_hdf_gz, ___whdload_WHDLoad_hdf_gz_len, 1, whdload_hdf_gz_fp);
+                fclose(whdload_hdf_gz_fp);
+
+                /* Extract GZ */
+                struct gzFile_s *whdload_hdf_gz_fp;
+                if ((whdload_hdf_gz_fp = gzopen(whdload_hdf_gz, "r")))
+                {
+                   FILE *whdload_hdf_fp;
+                   if ((whdload_hdf_fp = fopen(whdload_hdf, "wb")))
+                   {
+                      gz_uncompress(whdload_hdf_gz_fp, whdload_hdf_fp);
+                      fclose(whdload_hdf_fp);
+                   }
+                   gzclose(whdload_hdf_gz_fp);
+                }
+                remove(whdload_hdf_gz);
+             }
+             else
+                LOGI("[libretro-uae4arm]: Unable to create WHDLoad image file: '%s'\n", (const char*)&whdload_hdf);
+          }
+
+          /* Attach HDF */
+          if (my_existsfile(whdload_hdf))
+          {
+              //uaedev_config_info ci;
+              struct uaedev_config_info *uci;
+
+              LOGI("[libretro-uae4arm]: Attach HDF\n");
+
+              uci = add_filesys_config(prefs, -1, "WHDLoad", 0, whdload_hdf, 0, 
+                    32, 1, 2, 512, 0, 0, 0, 0);
+
+              if (uci)
+                  hardfile_do_disk_change (uci, 1);
+          }
+          /* Attach LHA */
+          struct uaedev_config_info *uci;
+
+          LOGI("[libretro-uae4arm]: Attach LHA\n");
+
+          uci = add_filesys_config(prefs, -1, "DH0", "LHA", RPATH, 
+            0, 0, 0, 0, 0, -128, 0, 0, 0);
+          if (uci)
+              filesys_media_change (uci->rootdir, 1, uci);
+      }
+
       if (strcmp(var.value, "A600") == 0)
       {
          //strcat(uae_machine, A600);
          //strcpy(uae_kickstart, A600_ROM);
-         changed_prefs.cpu_model = 68000;
-         changed_prefs.chipmem_size = 2 * 0x80000;
-         changed_prefs.m68k_speed = M68K_SPEED_7MHZ_CYCLES;
-         changed_prefs.cpu_compatible = 0;
-         changed_prefs.address_space_24 = 1;
-         changed_prefs.chipset_mask = CSMASK_ECS_DENISE | CSMASK_ECS_AGNUS;
-         //strcpy(changed_prefs.romfile, A600_ROM);
-         path_join(changed_prefs.romfile, retro_system_directory, A600_ROM);
+         prefs->cpu_model = 68000;
+         prefs->chipmem_size = 2 * 0x80000;
+         prefs->m68k_speed = M68K_SPEED_7MHZ_CYCLES;
+         prefs->cpu_compatible = 0;
+         prefs->address_space_24 = 1;
+         prefs->chipset_mask = CSMASK_ECS_DENISE | CSMASK_ECS_AGNUS;
+         //strcpy(prefs->romfile, A600_ROM);
+         path_join(prefs->romfile, retro_system_directory, A600_ROM);
       }
       else if (strcmp(var.value, "A1200") == 0)
       {
          //strcat(uae_machine, A1200);
          //strcpy(uae_kickstart, A1200_ROM);
-         //changed_prefs.cpu_type="68ec020";
-         changed_prefs.cpu_model = 68020;
-         changed_prefs.chipmem_size = 4 * 0x80000;
-         changed_prefs.m68k_speed = M68K_SPEED_14MHZ_CYCLES;
-         changed_prefs.cpu_compatible = 0;
-         changed_prefs.address_space_24 = 1;
-         changed_prefs.chipset_mask = CSMASK_AGA | CSMASK_ECS_DENISE | CSMASK_ECS_AGNUS;
-         //strcpy(changed_prefs.romfile, A1200_ROM);
-         path_join(changed_prefs.romfile, retro_system_directory, A1200_ROM);
+         //prefs->cpu_type="68ec020";
+         prefs->cpu_model = 68020;
+         prefs->chipmem_size = 4 * 0x80000;
+         prefs->m68k_speed = M68K_SPEED_14MHZ_CYCLES;
+         prefs->cpu_compatible = 0;
+         prefs->address_space_24 = 1;
+         prefs->chipset_mask = CSMASK_AGA | CSMASK_ECS_DENISE | CSMASK_ECS_AGNUS;
+         //strcpy(prefs->romfile, A1200_ROM);
+         path_join(prefs->romfile, retro_system_directory, A1200_ROM);
       }
-     else // if (strcmp(var.value, "A500") == 0)
+      else // if (strcmp(var.value, "A500") == 0)
       {
          //strcat(uae_machine, A500);
          //strcpy(uae_kickstart, A500_ROM);
-         //changed_prefs.cpu_type="68000";
+         //prefs->cpu_type="68000";
          
-         changed_prefs.cpu_model = 68000;
-         changed_prefs.m68k_speed = M68K_SPEED_7MHZ_CYCLES;
-         changed_prefs.cpu_compatible = 0;
-         changed_prefs.chipmem_size = 2 * 0x80000;
-         changed_prefs.address_space_24 = 1;
-         changed_prefs.chipset_mask = CSMASK_ECS_AGNUS;
-         //strcpy(changed_prefs.romfile, A500_ROM);
-         path_join(changed_prefs.romfile, retro_system_directory, A500_ROM);
+         prefs->cpu_model = 68000;
+         prefs->m68k_speed = M68K_SPEED_7MHZ_CYCLES;
+         prefs->cpu_compatible = 0;
+         prefs->chipmem_size = 2 * 0x80000;
+         prefs->address_space_24 = 1;
+         prefs->chipset_mask = CSMASK_ECS_AGNUS;
+         //strcpy(prefs->romfile, A500_ROM);
+         path_join(prefs->romfile, retro_system_directory, A500_ROM);
       }
    }
 
@@ -265,23 +369,23 @@ static void update_variables(void)
    {
       if (strcmp(var.value, "None") == 0)
       {
-         changed_prefs.fastmem_size = 0;
+         prefs->fastmem_size = 0;
       }
       if (strcmp(var.value, "1 MB") == 0)
       {
-         changed_prefs.fastmem_size = 0x100000;
+         prefs->fastmem_size = 0x100000;
       }
       if (strcmp(var.value, "2 MB") == 0)
       {
-         changed_prefs.fastmem_size = 0x100000 * 2;
+         prefs->fastmem_size = 0x100000 * 2;
       }
       if (strcmp(var.value, "4 MB") == 0)
       {
-         changed_prefs.fastmem_size = 0x100000 * 4;
+         prefs->fastmem_size = 0x100000 * 4;
       }
       if (strcmp(var.value, "8 MB") == 0)
       {
-         changed_prefs.fastmem_size = 0x100000 * 8;
+         prefs->fastmem_size = 0x100000 * 8;
       }
    }
 
@@ -290,10 +394,9 @@ static void update_variables(void)
    var.value = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      changed_prefs.floppy_speed=atoi(var.value);
+      prefs->floppy_speed=atoi(var.value);
    }
-   
-   //fixup_prefs (&changed_prefs);
+
 }
 
 static void retro_wrap_emulator()
@@ -326,11 +429,6 @@ void Emu_init(){
       mainThread = co_active();
       emuThread = co_create(8*65536*sizeof(void*), retro_wrap_emulator);
    }
-
-   default_prefs (&changed_prefs, 0);
-   default_prefs (&currprefs, 0);
-
-   //update_variables();
 }
 
 void Emu_uninit(){
@@ -518,16 +616,15 @@ void retro_run(void)
    bool updated = false;
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
-      update_variables();
+      update_prefs_retrocfg(&changed_prefs);
+
+   co_switch(emuThread);
 
    if(pauseg==0)
-   {
-      if(SHOWKEY )retro_virtualkb();
-   }
+      if(SHOWKEY )
+         retro_virtualkb();
 
    video_cb(Retro_Screen,retrow,retroh,retrow<<PIXEL_BYTES);
- 
-   co_switch(emuThread);
 
 }
 
@@ -540,8 +637,6 @@ bool retro_load_game(const struct retro_game_info *info)
    full_path = info->path;
 
    strcpy(RPATH,full_path);
-
-   update_variables();
 
 #ifdef RENDER16B
    memset(Retro_Screen,0,1280*1024*2);
