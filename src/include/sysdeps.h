@@ -460,8 +460,6 @@ static inline uae_u32 do_byteswap_16(uae_u32 v) {__asm__ (
 #include <psp2/types.h>
 #include <psp2/io/dirent.h>
 #include <psp2/kernel/threadmgr.h>
-#define mkdir(name,mode) sceIoMkdir(name, 0777)
-#define rmdir(name) sceIoRmdir(name)
 #define chmod(a, b)
 #endif
 
